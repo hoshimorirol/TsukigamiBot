@@ -779,6 +779,33 @@ async def stats(interaction: discord.Interaction):
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
+# ============================================
+# SERVIDOR WEB PARA MANTENER RAILWAY ACTIVO
+# ============================================
+from flask import Flask
+import threading
+import os
+
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "🌙 TsukigamiBot is running!"
+
+def run_web():
+    port = int(os.getenv('PORT', 8080))
+    app.run(host='0.0.0.0', port=port)
+
+# Iniciar el servidor web en un hilo separado
+web_thread = threading.Thread(target=run_web)
+web_thread.daemon = True
+web_thread.start()
+
+# ============================================
+# INICIAR BOT DE DISCORD
+# ============================================
+bot.run(TOKEN)
+
 # ==================== INICIAR ====================
 if __name__ == "__main__":
     bot.run(TOKEN)
