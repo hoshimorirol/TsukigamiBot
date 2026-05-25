@@ -792,16 +792,15 @@ app = Flask(__name__)
 def home():
     return "🌙 TsukigamiBot is running!"
 
-def run_web():
-    port = int(os.getenv('PORT', 8080))
-    app.run(host='0.0.0.0', port=port)
+def run_bot():
+    bot.run(TOKEN)
 
-# Iniciar el servidor web en un hilo separado (ANTES del bot)
-web_thread = threading.Thread(target=run_web)
-web_thread.daemon = True
-web_thread.start()
+# Iniciar el bot de Discord en un hilo separado (segundo plano)
+bot_thread = threading.Thread(target=run_bot)
+bot_thread.daemon = True
+bot_thread.start()
 
-# ============================================
-# INICIAR BOT DE DISCORD
-# ============================================
-bot.run(TOKEN)
+# Iniciar Flask en el proceso principal (bloqueante)
+# Railway detectará el puerto y mantendrá el contenedor vivo
+port = int(os.getenv('PORT', 8080))
+app.run(host='0.0.0.0', port=port)
