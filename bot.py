@@ -268,7 +268,6 @@ class ReviewCommentModal(discord.ui.Modal):
         if not is_staff(interaction.user):
             return await interaction.response.send_message("⛔ No tienes permiso.", ephemeral=True)
 
-        # 🔴 RESPUESTA INMEDIATA: evita el timeout de 3 segundos de Discord
         await interaction.response.send_message("⏳ Procesando revisión...", ephemeral=True)
 
         try:
@@ -383,7 +382,6 @@ class BanCommentModal(discord.ui.Modal):
         if not is_staff(interaction.user):
             return await interaction.response.send_message("⛔ No tienes permiso.", ephemeral=True)
 
-        # 🔴 RESPUESTA INMEDIATA
         await interaction.response.send_message("⏳ Procesando baneo...", ephemeral=True)
 
         try:
@@ -436,7 +434,6 @@ class Bot(commands.Bot):
         self.pending_answers = {}
 
     def build_review_view(self, app_id: int, user_id: int) -> discord.ui.View:
-        # timeout=None = botones persisten para siempre
         view = discord.ui.View(timeout=None)
 
         btn_accept = discord.ui.Button(
@@ -648,11 +645,28 @@ class Bot(commands.Bot):
         fallidos = 0
 
         for msg_id, ch_id, app_id, user_id in rows:
+            channel = self.get_channel(ch_id)
+            if not channel:
+                fallidos += 1
+                continue
+                
             try:
-                # ✅ FORMA CORRECTA: re-registrar el view sin tocar el mensaje en Discord
+                # 🔴 CRÍTICO: Para mensajes viejos, editamos el mensaje para actualizar los botones
+                # con custom_id fijos. add_view solo no funciona si los custom_id no coinciden.
+                msg = await channel.fetch_message(msg_id)
                 view = self.build_review_view(app_id, user_id)
-                self.add_view(view, message_id=msg_id)
+                await msg.edit(view=view)  # Reemplaza botones viejos por nuevos con custom_id fijos
+                self.add_view(view, message_id=msg_id)  # Registra en memoria para futuros reinicios
                 reconstruidos += 1
+            except discord.NotFound:
+                # El mensaje fue borrado, limpiamos de la base de datos
+                print(f"🗑️ Mensaje {msg_id} borrado, eliminando registro...")
+                conn = sqlite3.connect('applications.db')
+                c = conn.cursor()
+                c.execute("DELETE FROM review_messages WHERE message_id=?", (msg_id,))
+                conn.commit()
+                conn.close()
+                fallidos += 1
             except Exception as e:
                 print(f"⚠️ No se pudo reconstruir mensaje {msg_id}: {e}")
                 fallidos += 1
