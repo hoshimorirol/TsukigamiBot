@@ -5,6 +5,7 @@ import sqlite3
 import datetime
 import io
 import os
+import threading
 
 # ==================== CONFIGURACIÓN ====================
 TOKEN = os.getenv("TOKEN", "")
@@ -53,7 +54,6 @@ def has_member_role(member: discord.Member) -> bool:
     return member_role in member.roles if member_role else False
 
 async def generate_transcript(channel: discord.TextChannel):
-    """Genera un archivo .txt con la transcripción del ticket."""
     lines = []
     lines.append(f"TRANSCRIPCIÓN DE TICKET: #{channel.name}")
     lines.append(f"Servidor: {channel.guild.name}")
@@ -199,16 +199,15 @@ class ApplicationModalPart2(discord.ui.Modal, title="Solicitud — Parte 2 de 2"
                 "❌ Ya tienes una solicitud pendiente.", ephemeral=True
             )
 
-        # PREGUNTAS EN FORMATO NEGRITA GRANDE (como en la imagen de ejemplo)
         answers_text = (
-            f"**1. ¿Cómo te enteraste de Hoshizora? (A través de Alianzas, Disboard, alguien te invitó o lo viste publicado en otro servidor)**\n{part1['q1']}\n\n"
-            f"**2. ¿Estás de acuerdo con las normas del Servidor y las Reglas comunitarias establecidas?**\n{part1['q2']}\n\n"
+            f"**1. ¿Cómo te enteraste de Hoshizora?**\n{part1['q1']}\n\n"
+            f"**2. ¿Estás de acuerdo con las normas?**\n{part1['q2']}\n\n"
             f"**3. ¿Qué edad tienes?**\n{part1['q3']}\n\n"
             f"**4. ¿Tienes experiencia previa en DnD u otros TTRPG?**\n{part1['q4']}\n\n"
             f"**5. ¿Juegas en PC, teléfono u otro dispositivo?**\n{part1['q5']}\n\n"
             f"**6. ¿Tienes micrófono?**\n{self.q6.value}\n\n"
-            f"**7. ¿Qué esperas de esta experiencia de juego en nuestro servidor?**\n{self.q7.value}\n\n"
-            f"**8. ¿Te sientes cómodo siguiendo reglas caseras o modificaciones a las reglas estándar?**\n{self.q8.value}"
+            f"**7. ¿Qué esperas de esta experiencia?**\n{self.q7.value}\n\n"
+            f"**8. ¿Te sientes cómodo con reglas caseras?**\n{self.q8.value}"
         )
 
         c.execute(
@@ -269,90 +268,99 @@ class ReviewCommentModal(discord.ui.Modal):
         if not is_staff(interaction.user):
             return await interaction.response.send_message("⛔ No tienes permiso.", ephemeral=True)
 
-        member = interaction.guild.get_member(self.user_id)
-        conn = sqlite3.connect('applications.db')
-        c = conn.cursor()
+        # 🔴 RESPUESTA INMEDIATA: evita el timeout de 3 segundos de Discord
+        await interaction.response.send_message("⏳ Procesando revisión...", ephemeral=True)
 
-        if self.action == "accepted":
-            if member:
-                member_role = interaction.guild.get_role(MEMBER_ROLE_ID)
-                if member_role:
-                    await member.add_roles(member_role, reason=f"Aceptado por {interaction.user}")
-                if UNVERIFIED_ROLE_ID:
-                    unv = interaction.guild.get_role(UNVERIFIED_ROLE_ID)
-                    if unv and unv in member.roles:
-                        await member.remove_roles(unv)
+        try:
+            member = interaction.guild.get_member(self.user_id)
+            conn = sqlite3.connect('applications.db')
+            c = conn.cursor()
 
-                try:
-                    dm_embed = discord.Embed(
-                        title=f"✅ Aceptado en {interaction.guild.name}",
-                        description=f"**Comentario del staff:**\n{self.note.value}",
-                        color=discord.Color.green()
-                    )
-                    await member.send(embed=dm_embed)
-                except discord.Forbidden:
-                    pass
+            if self.action == "accepted":
+                if member:
+                    member_role = interaction.guild.get_role(MEMBER_ROLE_ID)
+                    if member_role:
+                        await member.add_roles(member_role, reason=f"Aceptado por {interaction.user}")
+                    if UNVERIFIED_ROLE_ID:
+                        unv = interaction.guild.get_role(UNVERIFIED_ROLE_ID)
+                        if unv and unv in member.roles:
+                            await member.remove_roles(unv)
 
-            c.execute(
-                "UPDATE applications SET status=?, reviewed_by=?, review_note=? WHERE id=?",
-                ("accepted", interaction.user.id, self.note.value, self.app_id)
+                    try:
+                        dm_embed = discord.Embed(
+                            title=f"✅ Aceptado en {interaction.guild.name}",
+                            description=f"**Comentario del staff:**\n{self.note.value}",
+                            color=discord.Color.green()
+                        )
+                        await member.send(embed=dm_embed)
+                    except discord.Forbidden:
+                        pass
+
+                c.execute(
+                    "UPDATE applications SET status=?, reviewed_by=?, review_note=? WHERE id=?",
+                    ("accepted", interaction.user.id, self.note.value, self.app_id)
+                )
+
+                new_embed = discord.Embed(
+                    title=f"📋 Solicitud #{self.app_id} — ✅ ACEPTADA",
+                    description=f"**Solicitante:** {member.mention if member else 'Desconocido'} (`{self.user_id}`)",
+                    color=discord.Color.green(),
+                    timestamp=datetime.datetime.now()
+                )
+                c.execute("SELECT answers FROM applications WHERE id=?", (self.app_id,))
+                row = c.fetchone()
+                if row:
+                    new_embed.add_field(name="Respuestas", value=row[0], inline=False)
+                new_embed.add_field(name="📝 Comentario del staff", value=self.note.value, inline=False)
+                new_embed.set_footer(text=f"Revisado por {interaction.user.display_name}")
+                await self.original_message.edit(embed=new_embed, view=None)
+
+                await interaction.edit_original_response(
+                    content=f"✅ Solicitud #{self.app_id} **aceptada correctamente.**"
+                )
+
+            elif self.action == "denied":
+                if member:
+                    try:
+                        dm_embed = discord.Embed(
+                            title=f"❌ Solicitud denegada en {interaction.guild.name}",
+                            description=f"**Motivo:**\n{self.note.value}",
+                            color=discord.Color.red()
+                        )
+                        await member.send(embed=dm_embed)
+                    except discord.Forbidden:
+                        pass
+
+                c.execute(
+                    "UPDATE applications SET status=?, reviewed_by=?, review_note=? WHERE id=?",
+                    ("denied", interaction.user.id, self.note.value, self.app_id)
+                )
+
+                new_embed = discord.Embed(
+                    title=f"📋 Solicitud #{self.app_id} — ❌ DENEGADA",
+                    description=f"**Solicitante:** {member.mention if member else 'Desconocido'} (`{self.user_id}`)",
+                    color=discord.Color.red(),
+                    timestamp=datetime.datetime.now()
+                )
+                c.execute("SELECT answers FROM applications WHERE id=?", (self.app_id,))
+                row = c.fetchone()
+                if row:
+                    new_embed.add_field(name="Respuestas", value=row[0], inline=False)
+                new_embed.add_field(name="📝 Comentario del staff", value=self.note.value, inline=False)
+                new_embed.set_footer(text=f"Revisado por {interaction.user.display_name}")
+                await self.original_message.edit(embed=new_embed, view=None)
+
+                await interaction.edit_original_response(
+                    content=f"❌ Solicitud #{self.app_id} **denegada correctamente.**"
+                )
+
+            conn.commit()
+            conn.close()
+
+        except Exception as e:
+            await interaction.edit_original_response(
+                content=f"❌ **Error al procesar:** {str(e)}\nRevisá los permisos del bot o intentá de nuevo."
             )
-
-            new_embed = discord.Embed(
-                title=f"📋 Solicitud #{self.app_id} — ✅ ACEPTADA",
-                description=f"**Solicitante:** {member.mention if member else 'Desconocido'} (`{self.user_id}`)",
-                color=discord.Color.green(),
-                timestamp=datetime.datetime.now()
-            )
-            c.execute("SELECT answers FROM applications WHERE id=?", (self.app_id,))
-            row = c.fetchone()
-            if row:
-                new_embed.add_field(name="Respuestas", value=row[0], inline=False)
-            new_embed.add_field(name="📝 Comentario del staff", value=self.note.value, inline=False)
-            new_embed.set_footer(text=f"Revisado por {interaction.user.display_name}")
-            await self.original_message.edit(embed=new_embed, view=None)
-
-            await interaction.response.send_message(
-                f"✅ Solicitud #{self.app_id} **aceptada**", ephemeral=True
-            )
-
-        elif self.action == "denied":
-            if member:
-                try:
-                    dm_embed = discord.Embed(
-                        title=f"❌ Solicitud denegada en {interaction.guild.name}",
-                        description=f"**Motivo:**\n{self.note.value}",
-                        color=discord.Color.red()
-                    )
-                    await member.send(embed=dm_embed)
-                except discord.Forbidden:
-                    pass
-
-            c.execute(
-                "UPDATE applications SET status=?, reviewed_by=?, review_note=? WHERE id=?",
-                ("denied", interaction.user.id, self.note.value, self.app_id)
-            )
-
-            new_embed = discord.Embed(
-                title=f"📋 Solicitud #{self.app_id} — ❌ DENEGADA",
-                description=f"**Solicitante:** {member.mention if member else 'Desconocido'} (`{self.user_id}`)",
-                color=discord.Color.red(),
-                timestamp=datetime.datetime.now()
-            )
-            c.execute("SELECT answers FROM applications WHERE id=?", (self.app_id,))
-            row = c.fetchone()
-            if row:
-                new_embed.add_field(name="Respuestas", value=row[0], inline=False)
-            new_embed.add_field(name="📝 Comentario del staff", value=self.note.value, inline=False)
-            new_embed.set_footer(text=f"Revisado por {interaction.user.display_name}")
-            await self.original_message.edit(embed=new_embed, view=None)
-
-            await interaction.response.send_message(
-                f"❌ Solicitud #{self.app_id} **denegada**", ephemeral=True
-            )
-
-        conn.commit()
-        conn.close()
 
 # ==================== MODAL: COMENTARIO PARA BANEO ====================
 class BanCommentModal(discord.ui.Modal):
@@ -375,39 +383,48 @@ class BanCommentModal(discord.ui.Modal):
         if not is_staff(interaction.user):
             return await interaction.response.send_message("⛔ No tienes permiso.", ephemeral=True)
 
-        member = interaction.guild.get_member(self.user_id)
-        reason_text = self.note.value or "Sin comentario"
+        # 🔴 RESPUESTA INMEDIATA
+        await interaction.response.send_message("⏳ Procesando baneo...", ephemeral=True)
 
-        if member:
-            await member.ban(reason=f"Baneado desde panel por {interaction.user}: {reason_text}")
+        try:
+            member = interaction.guild.get_member(self.user_id)
+            reason_text = self.note.value or "Sin comentario"
 
-        conn = sqlite3.connect('applications.db')
-        c = conn.cursor()
-        c.execute(
-            "UPDATE applications SET status=?, reviewed_by=?, review_note=? WHERE id=?",
-            ("banned", interaction.user.id, reason_text, self.app_id)
-        )
+            if member:
+                await member.ban(reason=f"Baneado desde panel por {interaction.user}: {reason_text}")
 
-        new_embed = discord.Embed(
-            title=f"📋 Solicitud #{self.app_id} — 🔨 BANEADA",
-            description=f"**Solicitante:** {member.mention if member else 'Desconocido'} (`{self.user_id}`)",
-            color=discord.Color.dark_grey(),
-            timestamp=datetime.datetime.now()
-        )
-        c.execute("SELECT answers FROM applications WHERE id=?", (self.app_id,))
-        row = c.fetchone()
-        if row:
-            new_embed.add_field(name="Respuestas", value=row[0], inline=False)
-        new_embed.add_field(name="📝 Razón del baneo", value=reason_text, inline=False)
-        new_embed.set_footer(text=f"Baneado por {interaction.user.display_name}")
-        await self.original_message.edit(embed=new_embed, view=None)
+            conn = sqlite3.connect('applications.db')
+            c = conn.cursor()
+            c.execute(
+                "UPDATE applications SET status=?, reviewed_by=?, review_note=? WHERE id=?",
+                ("banned", interaction.user.id, reason_text, self.app_id)
+            )
 
-        conn.commit()
-        conn.close()
+            new_embed = discord.Embed(
+                title=f"📋 Solicitud #{self.app_id} — 🔨 BANEADA",
+                description=f"**Solicitante:** {member.mention if member else 'Desconocido'} (`{self.user_id}`)",
+                color=discord.Color.dark_grey(),
+                timestamp=datetime.datetime.now()
+            )
+            c.execute("SELECT answers FROM applications WHERE id=?", (self.app_id,))
+            row = c.fetchone()
+            if row:
+                new_embed.add_field(name="Respuestas", value=row[0], inline=False)
+            new_embed.add_field(name="📝 Razón del baneo", value=reason_text, inline=False)
+            new_embed.set_footer(text=f"Baneado por {interaction.user.display_name}")
+            await self.original_message.edit(embed=new_embed, view=None)
 
-        await interaction.response.send_message(
-            f"🔨 Usuario baneado y solicitud #{self.app_id} cerrada.", ephemeral=True
-        )
+            conn.commit()
+            conn.close()
+
+            await interaction.edit_original_response(
+                content=f"🔨 Usuario baneado y solicitud #{self.app_id} cerrada correctamente."
+            )
+
+        except Exception as e:
+            await interaction.edit_original_response(
+                content=f"❌ **Error al procesar:** {str(e)}\nRevisá los permisos del bot o intentá de nuevo."
+            )
 
 # ==================== BOT Y VIEWS ====================
 class Bot(commands.Bot):
@@ -419,6 +436,7 @@ class Bot(commands.Bot):
         self.pending_answers = {}
 
     def build_review_view(self, app_id: int, user_id: int) -> discord.ui.View:
+        # timeout=None = botones persisten para siempre
         view = discord.ui.View(timeout=None)
 
         btn_accept = discord.ui.Button(
@@ -532,7 +550,6 @@ class Bot(commands.Bot):
         )
         welcome_embed.set_footer(text="Sistema de Tickets — Hoshizora")
 
-        # BOTÓN CLOSE CON CONFIRMACIÓN
         close_btn = discord.ui.Button(
             style=discord.ButtonStyle.red,
             label="Close",
@@ -541,22 +558,18 @@ class Bot(commands.Bot):
         )
 
         async def close_callback(btn_interaction: discord.Interaction):
-            # Solo staff puede cerrar
             if not is_staff(btn_interaction.user):
                 return await btn_interaction.response.send_message("⛔ Solo staff puede cerrar tickets.", ephemeral=True)
 
-            # Crear embed de confirmación
             confirm_embed = discord.Embed(
                 title="🔒 ¿Cerrar Ticket?",
                 description="¿Estás seguro de que deseas cerrar este ticket?\nSe generará una transcripción automática.",
                 color=discord.Color.orange()
             )
 
-            # Crear botones de confirmación
             yes_btn = discord.ui.Button(style=discord.ButtonStyle.green, label="Sí, cerrar", emoji="✅")
             no_btn = discord.ui.Button(style=discord.ButtonStyle.grey, label="No, cancelar", emoji="❌")
 
-            # Variable de control para evitar múltiples clics
             clicked = False
 
             async def yes_callback(yes_interaction: discord.Interaction):
@@ -565,15 +578,12 @@ class Bot(commands.Bot):
                     return await yes_interaction.response.send_message("⏳ Ya se procesó esta acción.", ephemeral=True)
                 clicked = True
 
-                # Deshabilitar ambos botones
                 yes_btn.disabled = True
                 no_btn.disabled = True
                 await yes_interaction.response.edit_message(embed=confirm_embed, view=confirm_view)
 
-                # Generar transcript
                 file = await generate_transcript(ticket_ch)
 
-                # Enviar transcript al canal dedicado
                 transcript_ch = self.get_channel(TRANSCRIPT_CHANNEL_ID)
                 if transcript_ch:
                     transcript_embed = discord.Embed(
@@ -584,7 +594,6 @@ class Bot(commands.Bot):
                     )
                     await transcript_ch.send(embed=transcript_embed, file=file)
 
-                # Borrar el canal del ticket
                 await ticket_ch.delete(reason=f"Cerrado por {yes_interaction.user}")
 
             async def no_callback(no_interaction: discord.Interaction):
@@ -593,12 +602,10 @@ class Bot(commands.Bot):
                     return await no_interaction.response.send_message("⏳ Ya se procesó esta acción.", ephemeral=True)
                 clicked = True
 
-                # Deshabilitar ambos botones
                 yes_btn.disabled = True
                 no_btn.disabled = True
                 await no_interaction.response.edit_message(embed=confirm_embed, view=confirm_view)
 
-                # El ticket permanece abierto, solo informamos
                 await no_interaction.followup.send("❌ Cierre cancelado. El ticket permanece abierto.", ephemeral=True)
 
             yes_btn.callback = yes_callback
@@ -608,7 +615,6 @@ class Bot(commands.Bot):
             confirm_view.add_item(yes_btn)
             confirm_view.add_item(no_btn)
 
-            # Responder con el mensaje de confirmación efímero
             await btn_interaction.response.send_message(embed=confirm_embed, view=confirm_view, ephemeral=True)
 
         close_btn.callback = close_callback
@@ -626,6 +632,7 @@ class Bot(commands.Bot):
         await interaction.response.send_message(f"🎫 Ticket creado: {ticket_ch.mention}", ephemeral=True)
 
     async def setup_hook(self):
+        # 🔄 RECONSTRUIR BOTONES DE MENSAJES ANTIGUOS (persistencia al reiniciar)
         conn = sqlite3.connect('applications.db')
         c = conn.cursor()
         c.execute("""
@@ -637,15 +644,20 @@ class Bot(commands.Bot):
         rows = c.fetchall()
         conn.close()
 
+        reconstruidos = 0
+        fallidos = 0
+
         for msg_id, ch_id, app_id, user_id in rows:
-            channel = self.get_channel(ch_id)
-            if channel:
-                try:
-                    msg = await channel.fetch_message(msg_id)
-                    view = self.build_review_view(app_id, user_id)
-                    await msg.edit(view=view)
-                except Exception as e:
-                    print(f"No se pudo reconstruir mensaje {msg_id}: {e}")
+            try:
+                # ✅ FORMA CORRECTA: re-registrar el view sin tocar el mensaje en Discord
+                view = self.build_review_view(app_id, user_id)
+                self.add_view(view, message_id=msg_id)
+                reconstruidos += 1
+            except Exception as e:
+                print(f"⚠️ No se pudo reconstruir mensaje {msg_id}: {e}")
+                fallidos += 1
+
+        print(f"🔄 Views reconstruidos: {reconstruidos} | Fallidos: {fallidos}")
 
         guild = discord.Object(id=GUILD_ID)
         self.tree.copy_global_to(guild=guild)
@@ -711,7 +723,6 @@ async def setup_panel(interaction: discord.Interaction):
     embed.set_thumbnail(url=interaction.guild.icon.url if interaction.guild.icon else None)
     embed.set_footer(text="Sistema de Admisiones — Hoshizora")
 
-    # BOTÓN SIN EMOJI 📨
     button = discord.ui.Button(
         style=discord.ButtonStyle.green,
         label="Enviar Solicitud",
@@ -783,8 +794,6 @@ async def stats(interaction: discord.Interaction):
 # SERVIDOR WEB PARA MANTENER RAILWAY ACTIVO
 # ============================================
 from flask import Flask
-import threading
-import os
 
 app = Flask(__name__)
 
@@ -795,12 +804,11 @@ def home():
 def run_bot():
     bot.run(TOKEN)
 
-# Iniciar el bot de Discord en un hilo separado (segundo plano)
+# Iniciar el bot de Discord en un hilo separado
 bot_thread = threading.Thread(target=run_bot)
 bot_thread.daemon = True
 bot_thread.start()
 
-# Iniciar Flask en el proceso principal (bloqueante)
-# Railway detectará el puerto y mantendrá el contenedor vivo
+# Iniciar Flask en el proceso principal (Railway detecta el puerto)
 port = int(os.getenv('PORT', 8080))
 app.run(host='0.0.0.0', port=port)
