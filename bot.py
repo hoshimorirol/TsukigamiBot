@@ -38,6 +38,12 @@ def init_db():
         app_id INTEGER,
         user_id INTEGER
     )''')
+    # NUEVO: tabla para persistir respuestas de la Parte 1
+    c.execute('''CREATE TABLE IF NOT EXISTS draft_answers (
+        user_id INTEGER PRIMARY KEY,
+        q1 TEXT, q2 TEXT, q3 TEXT, q4 TEXT, q5 TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )''')
     conn.commit()
     conn.close()
 
@@ -52,6 +58,20 @@ def is_staff(member: discord.Member) -> bool:
 def has_member_role(member: discord.Member) -> bool:
     member_role = member.guild.get_role(MEMBER_ROLE_ID)
     return member_role in member.roles if member_role else False
+
+def has_pending_application(user_id: int) -> bool:
+    """Devuelve True solo si hay una solicitud pending de menos de 7 días."""
+    conn = sqlite3.connect('applications.db')
+    c = conn.cursor()
+    # Ignorar solicitudes pending de más de 7 días (atascadas)
+    c.execute("""
+        SELECT id FROM applications 
+        WHERE user_id=? AND status='pending' 
+        AND created_at >= datetime('now', '-7 days')
+    """, (user_id,))
+    row = c.fetchone()
+    conn.close()
+    return row is not None
 
 async def generate_transcript(channel: discord.TextChannel):
     lines = []
@@ -123,14 +143,16 @@ class ApplicationModalPart1(discord.ui.Modal, title="Solicitud — Parte 1 de 2"
     )
 
     async def on_submit(self, interaction: discord.Interaction):
-        bot = interaction.client
-        bot.pending_answers[interaction.user.id] = {
-            "q1": self.q1.value,
-            "q2": self.q2.value,
-            "q3": self.q3.value,
-            "q4": self.q4.value,
-            "q5": self.q5.value,
-        }
+        # GUARDAR EN SQLITE en vez de memoria RAM
+        conn = sqlite3.connect('applications.db')
+        c = conn.cursor()
+        c.execute('''INSERT OR REPLACE INTO draft_answers 
+            (user_id, q1, q2, q3, q4, q5, created_at) 
+            VALUES (?, ?, ?, ?, ?, ?, datetime('now'))''',
+            (interaction.user.id, self.q1.value, self.q2.value,
+             self.q3.value, self.q4.value, self.q5.value))
+        conn.commit()
+        conn.close()
 
         btn = discord.ui.Button(
             style=discord.ButtonStyle.primary,
@@ -142,7 +164,7 @@ class ApplicationModalPart1(discord.ui.Modal, title="Solicitud — Parte 1 de 2"
             await btn_interaction.response.send_modal(ApplicationModalPart2())
 
         btn.callback = open_part2
-        view = discord.ui.View(timeout=600)
+        view = discord.ui.View(timeout=7200)  # 2 horas
         view.add_item(btn)
 
         await interaction.response.send_message(
@@ -176,7 +198,6 @@ class ApplicationModalPart2(discord.ui.Modal, title="Solicitud — Parte 2 de 2"
     )
 
     async def on_submit(self, interaction: discord.Interaction):
-        bot = interaction.client
         user_id = interaction.user.id
 
         if has_member_role(interaction.user):
@@ -184,15 +205,19 @@ class ApplicationModalPart2(discord.ui.Modal, title="Solicitud — Parte 2 de 2"
                 "❌ Ya eres miembro del servidor. No necesitas enviar una solicitud.", ephemeral=True
             )
 
-        part1 = bot.pending_answers.pop(user_id, None)
+        # RECUPERAR de SQLite en vez de memoria
+        conn = sqlite3.connect('applications.db')
+        c = conn.cursor()
+        c.execute("SELECT q1, q2, q3, q4, q5 FROM draft_answers WHERE user_id=?", (user_id,))
+        part1 = c.fetchone()
+
         if not part1:
+            conn.close()
             return await interaction.response.send_message(
                 "❌ Se perdió la información de la Parte 1. Usa `/apply` de nuevo.", ephemeral=True
             )
 
-        conn = sqlite3.connect('applications.db')
-        c = conn.cursor()
-        c.execute("SELECT id FROM applications WHERE user_id=? AND status='pending'", (user_id,))
+        c.execute("SELECT id FROM applications WHERE user_id=? AND status='pending' AND created_at >= datetime('now', '-7 days')", (user_id,))
         if c.fetchone():
             conn.close()
             return await interaction.response.send_message(
@@ -200,11 +225,11 @@ class ApplicationModalPart2(discord.ui.Modal, title="Solicitud — Parte 2 de 2"
             )
 
         answers_text = (
-            f"**1. ¿Cómo te enteraste de Hoshizora?**\n{part1['q1']}\n\n"
-            f"**2. ¿Estás de acuerdo con las normas?**\n{part1['q2']}\n\n"
-            f"**3. ¿Qué edad tienes?**\n{part1['q3']}\n\n"
-            f"**4. ¿Tienes experiencia previa en DnD u otros TTRPG?**\n{part1['q4']}\n\n"
-            f"**5. ¿Juegas en PC, teléfono u otro dispositivo?**\n{part1['q5']}\n\n"
+            f"**1. ¿Cómo te enteraste de Hoshizora?**\n{part1[0]}\n\n"
+            f"**2. ¿Estás de acuerdo con las normas?**\n{part1[1]}\n\n"
+            f"**3. ¿Qué edad tienes?**\n{part1[2]}\n\n"
+            f"**4. ¿Tienes experiencia previa en DnD u otros TTRPG?**\n{part1[3]}\n\n"
+            f"**5. ¿Juegas en PC, teléfono u otro dispositivo?**\n{part1[4]}\n\n"
             f"**6. ¿Tienes micrófono?**\n{self.q6.value}\n\n"
             f"**7. ¿Qué esperas de esta experiencia?**\n{self.q7.value}\n\n"
             f"**8. ¿Te sientes cómodo con reglas caseras?**\n{self.q8.value}"
@@ -215,10 +240,13 @@ class ApplicationModalPart2(discord.ui.Modal, title="Solicitud — Parte 2 de 2"
             (user_id, str(interaction.user), 'pending', answers_text)
         )
         app_id = c.lastrowid
+
+        # Limpiar borrador
+        c.execute("DELETE FROM draft_answers WHERE user_id=?", (user_id,))
         conn.commit()
         conn.close()
 
-        review_ch = bot.get_channel(REVIEW_CHANNEL_ID)
+        review_ch = interaction.client.get_channel(REVIEW_CHANNEL_ID)
         if review_ch:
             embed = discord.Embed(
                 title=f"📋 Solicitud #{app_id} — ⏳ PENDIENTE",
@@ -230,7 +258,7 @@ class ApplicationModalPart2(discord.ui.Modal, title="Solicitud — Parte 2 de 2"
             embed.set_thumbnail(url=interaction.user.display_avatar.url)
             embed.set_footer(text="Esperando revisión del staff")
 
-            view = bot.build_review_view(app_id, interaction.user.id)
+            view = interaction.client.build_review_view(app_id, interaction.user.id)
             msg = await review_ch.send(embed=embed, view=view)
 
             conn = sqlite3.connect('applications.db')
@@ -431,7 +459,6 @@ class Bot(commands.Bot):
         intents.members = True
         intents.message_content = True
         super().__init__(command_prefix="!", intents=intents)
-        self.pending_answers = {}
 
     def build_review_view(self, app_id: int, user_id: int) -> discord.ui.View:
         view = discord.ui.View(timeout=None)
@@ -629,7 +656,7 @@ class Bot(commands.Bot):
         await interaction.response.send_message(f"🎫 Ticket creado: {ticket_ch.mention}", ephemeral=True)
 
     async def setup_hook(self):
-        # 🔄 RECONSTRUIR BOTONES DE MENSAJES ANTIGUOS (persistencia al reiniciar)
+        # RECONSTRUIR BOTONES DE MENSAJES ANTIGUOS (persistencia al reiniciar)
         conn = sqlite3.connect('applications.db')
         c = conn.cursor()
         c.execute("""
@@ -651,15 +678,12 @@ class Bot(commands.Bot):
                 continue
                 
             try:
-                # 🔴 CRÍTICO: Para mensajes viejos, editamos el mensaje para actualizar los botones
-                # con custom_id fijos. add_view solo no funciona si los custom_id no coinciden.
                 msg = await channel.fetch_message(msg_id)
                 view = self.build_review_view(app_id, user_id)
-                await msg.edit(view=view)  # Reemplaza botones viejos por nuevos con custom_id fijos
-                self.add_view(view, message_id=msg_id)  # Registra en memoria para futuros reinicios
+                await msg.edit(view=view)
+                self.add_view(view, message_id=msg_id)
                 reconstruidos += 1
             except discord.NotFound:
-                # El mensaje fue borrado, limpiamos de la base de datos
                 print(f"🗑️ Mensaje {msg_id} borrado, eliminando registro...")
                 conn = sqlite3.connect('applications.db')
                 c = conn.cursor()
@@ -690,12 +714,16 @@ async def apply(interaction: discord.Interaction):
             "❌ Ya eres miembro del servidor. No necesitas enviar una solicitud.", ephemeral=True
         )
 
+    if has_pending_application(interaction.user.id):
+        return await interaction.response.send_message(
+            "❌ Ya tienes una solicitud pendiente. Si lleva mucho tiempo, usa `/cancel_apply` para retirarla.", ephemeral=True
+        )
+
+    # Limpiar borrador viejo si existe
     conn = sqlite3.connect('applications.db')
     c = conn.cursor()
-    c.execute("SELECT id FROM applications WHERE user_id=? AND status='pending'", (interaction.user.id,))
-    if c.fetchone():
-        conn.close()
-        return await interaction.response.send_message("❌ Ya tienes una solicitud pendiente.", ephemeral=True)
+    c.execute("DELETE FROM draft_answers WHERE user_id=?", (interaction.user.id,))
+    conn.commit()
     conn.close()
 
     btn = discord.ui.Button(
@@ -719,6 +747,29 @@ async def apply(interaction: discord.Interaction):
         "Haz clic para iniciar tu solicitud de ingreso a **Hoshizora**.",
         view=view,
         ephemeral=True
+    )
+
+@bot.tree.command(name="cancel_apply", description="Retirar tu solicitud pendiente", guild=discord.Object(id=GUILD_ID))
+async def cancel_apply(interaction: discord.Interaction):
+    if has_member_role(interaction.user):
+        return await interaction.response.send_message("❌ Ya eres miembro.", ephemeral=True)
+
+    conn = sqlite3.connect('applications.db')
+    c = conn.cursor()
+    c.execute("SELECT id FROM applications WHERE user_id=? AND status='pending'", (interaction.user.id,))
+    row = c.fetchone()
+
+    if not row:
+        conn.close()
+        return await interaction.response.send_message("❌ No tienes solicitudes pendientes.", ephemeral=True)
+
+    c.execute("UPDATE applications SET status='cancelled' WHERE id=?", (row[0],))
+    c.execute("DELETE FROM draft_answers WHERE user_id=?", (interaction.user.id,))
+    conn.commit()
+    conn.close()
+
+    await interaction.response.send_message(
+        f"✅ Solicitud `#{row[0]}` retirada. Podés volver a aplicar con `/apply`.", ephemeral=True
     )
 
 @bot.tree.command(name="setup", description="Publicar panel de solicitudes (Admin)", guild=discord.Object(id=GUILD_ID))
@@ -750,12 +801,16 @@ async def setup_panel(interaction: discord.Interaction):
                 "❌ Ya eres miembro del servidor. No necesitas enviar una solicitud.", ephemeral=True
             )
 
+        if has_pending_application(btn_interaction.user.id):
+            return await btn_interaction.response.send_message(
+                "❌ Ya tienes una solicitud pendiente. Si lleva mucho tiempo, usa `/cancel_apply`.", ephemeral=True
+            )
+
+        # Limpiar borrador viejo si existe
         conn = sqlite3.connect('applications.db')
         c = conn.cursor()
-        c.execute("SELECT id FROM applications WHERE user_id=? AND status='pending'", (btn_interaction.user.id,))
-        if c.fetchone():
-            conn.close()
-            return await btn_interaction.response.send_message("❌ Ya tienes una solicitud pendiente.", ephemeral=True)
+        c.execute("DELETE FROM draft_answers WHERE user_id=?", (btn_interaction.user.id,))
+        conn.commit()
         conn.close()
 
         btn = discord.ui.Button(
@@ -799,7 +854,7 @@ async def stats(interaction: discord.Interaction):
 
     embed = discord.Embed(title="📊 Estadísticas", color=discord.Color.purple())
     for status, count in rows:
-        emoji = {"pending": "⏳", "accepted": "✅", "denied": "❌", "banned": "🔨"}.get(status, "•")
+        emoji = {"pending": "⏳", "accepted": "✅", "denied": "❌", "banned": "🔨", "cancelled": "🚫"}.get(status, "•")
         embed.add_field(name=f"{emoji} {status.upper()}", value=str(count), inline=True)
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
