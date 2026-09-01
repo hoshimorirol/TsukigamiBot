@@ -347,6 +347,7 @@ class ReviewCommentModal(discord.ui.Modal):
                 )
 
             elif self.action == "denied":
+                kicked = False
                 if member:
                     try:
                         dm_embed = discord.Embed(
@@ -358,13 +359,24 @@ class ReviewCommentModal(discord.ui.Modal):
                     except discord.Forbidden:
                         pass
 
+                    # 👢 Expulsar al usuario automáticamente
+                    try:
+                        await member.kick(
+                            reason=f"Denegado desde panel por {interaction.user}: {self.note.value}"
+                        )
+                        kicked = True
+                    except discord.Forbidden:
+                        pass  # El bot no tiene permisos de expulsar
+                    except Exception:
+                        pass  # Cualquier otro error, no detener el flujo
+
                 c.execute(
                     "UPDATE applications SET status=?, reviewed_by=?, review_note=? WHERE id=?",
                     ("denied", interaction.user.id, self.note.value, self.app_id)
                 )
 
                 new_embed = discord.Embed(
-                    title=f"📋 Solicitud #{self.app_id} — ❌ DENEGADA",
+                    title=f"📋 Solicitud #{self.app_id} — ❌ DENEGADA {'👢' if kicked else ''}",
                     description=f"**Solicitante:** {member.mention if member else 'Desconocido'} (`{self.user_id}`)",
                     color=discord.Color.red(),
                     timestamp=datetime.datetime.now()
@@ -374,11 +386,18 @@ class ReviewCommentModal(discord.ui.Modal):
                 if row:
                     new_embed.add_field(name="Respuestas", value=row[0], inline=False)
                 new_embed.add_field(name="📝 Comentario del staff", value=self.note.value, inline=False)
+                if kicked:
+                    new_embed.add_field(
+                        name="👢 Acción tomada",
+                        value="El usuario fue expulsado del servidor automáticamente.",
+                        inline=False
+                    )
                 new_embed.set_footer(text=f"Revisado por {interaction.user.display_name}")
                 await self.original_message.edit(embed=new_embed, view=None)
 
+                kick_msg = " y expulsado" if kicked else ""
                 await interaction.edit_original_response(
-                    content=f"❌ Solicitud #{self.app_id} **denegada correctamente.**"
+                    content=f"❌ Solicitud #{self.app_id} **denegada correctamente**{kick_msg}."
                 )
 
             conn.commit()
