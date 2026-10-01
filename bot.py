@@ -17,6 +17,7 @@ ADMIN_ROLE_ID = int(os.getenv("ADMIN_ROLE_ID", "0"))
 MODERATOR_ROLE_ID = int(os.getenv("MODERATOR_ROLE_ID", "0"))
 MEMBER_ROLE_ID = int(os.getenv("MEMBER_ROLE_ID", "0"))
 UNVERIFIED_ROLE_ID = int(os.getenv("UNVERIFIED_ROLE_ID", "0"))
+INVITE_LOG_CHANNEL_ID = int(os.getenv("INVITE_LOG_CHANNEL_ID", "0"))
 
 # ==================== BASE DE DATOS ====================
 def init_db():
@@ -48,6 +49,31 @@ def init_db():
     conn.close()
 
 init_db()
+
+# ==================== MÓDULO: INVITACIONES TRACKEADAS ====================
+INVITES_DB = 'invites.db'
+
+def init_invites_db():
+    conn = sqlite3.connect(INVITES_DB)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS tracked_invites (
+        code TEXT PRIMARY KEY,
+        platform TEXT NOT NULL,
+        channel_id INTEGER NOT NULL,
+        inviter_id INTEGER,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS tracked_joins (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        invite_code TEXT NOT NULL,
+        platform TEXT NOT NULL,
+        joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )''')
+    conn.commit()
+    conn.close()
+
+init_invites_db()
 
 # ==================== FUNCIONES AUXILIARES ====================
 def is_staff(member: discord.Member) -> bool:
@@ -149,8 +175,8 @@ class ApplicationModalPart1(discord.ui.Modal, title="Solicitud — Parte 1 de 2"
         c.execute('''INSERT OR REPLACE INTO draft_answers 
             (user_id, q1, q2, q3, q4, q5, created_at) 
             VALUES (?, ?, ?, ?, ?, ?, datetime('now'))''',
-            (interaction.user.id, self.q1.value, self.q2.value,
-             self.q3.value, self.q4.value, self.q5.value))
+            (interaction.user.id, self.q1.value,
+             self.q2.value, self.q3.value, self.q4.value, self.q5.value))
         conn.commit()
         conn.close()
 
@@ -477,7 +503,9 @@ class Bot(commands.Bot):
         intents = discord.Intents.default()
         intents.members = True
         intents.message_content = True
+        intents.invites = True
         super().__init__(command_prefix="!", intents=intents)
+        self.invite_cache = {}  # {codigo_invitacion: usos}
 
     def build_review_view(self, app_id: int, user_id: int) -> discord.ui.View:
         view = discord.ui.View(timeout=None)
@@ -695,7 +723,7 @@ class Bot(commands.Bot):
             if not channel:
                 fallidos += 1
                 continue
-                
+
             try:
                 msg = await channel.fetch_message(msg_id)
                 view = self.build_review_view(app_id, user_id)
@@ -716,6 +744,16 @@ class Bot(commands.Bot):
 
         print(f"🔄 Views reconstruidos: {reconstruidos} | Fallidos: {fallidos}")
 
+        # NUEVO: cachear invitaciones para detectar cuál se usa al unirse alguien
+        guild_obj = self.get_guild(GUILD_ID)
+        if guild_obj:
+            try:
+                invites = await guild_obj.invites.fetch()
+                self.invite_cache = {inv.code: inv.uses for inv in invites}
+                print(f"🔗 Invitaciones cacheadas: {len(self.invite_cache)}")
+            except discord.Forbidden:
+                print("⚠️ Falta permiso 'Gestionar servidor' para leer invitaciones")
+
         guild = discord.Object(id=GUILD_ID)
         self.tree.copy_global_to(guild=guild)
         await self.tree.sync(guild=guild)
@@ -724,6 +762,75 @@ class Bot(commands.Bot):
         print(f"✅ Bot conectado como {self.user} ({self.user.id})")
 
 bot = Bot()
+
+# ==================== EVENTOS DE INVITACIONES ====================
+@bot.event
+async def on_invite_create(invite):
+    if invite.guild and invite.guild.id == GUILD_ID:
+        bot.invite_cache[invite.code] = invite.uses
+
+@bot.event
+async def on_invite_delete(invite):
+    if invite.guild and invite.guild.id == GUILD_ID:
+        bot.invite_cache.pop(invite.code, None)
+        conn = sqlite3.connect(INVITES_DB)
+        c = conn.cursor()
+        c.execute("DELETE FROM tracked_invites WHERE code=?", (invite.code,))
+        conn.commit()
+        conn.close()
+
+@bot.event
+async def on_member_join(member):
+    if member.guild.id != GUILD_ID:
+        return
+    try:
+        fresh = await member.guild.invites.fetch()
+    except discord.Forbidden:
+        return
+
+    # Comparar usos nuevos vs caché: la que subió es la que usó este miembro
+    used_code = None
+    for inv in fresh:
+        if inv.uses > bot.invite_cache.get(inv.code, 0) and used_code is None:
+            used_code = inv.code
+    bot.invite_cache = {inv.code: inv.uses for inv in fresh}
+
+    if not used_code:
+        return
+
+    conn = sqlite3.connect(INVITES_DB)
+    c = conn.cursor()
+    c.execute("SELECT platform FROM tracked_invites WHERE code=?", (used_code,))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        return  # invitación no trackeada (manual, vanity, etc.)
+
+    platform = row[0]
+    c.execute("INSERT INTO tracked_joins (user_id, invite_code, platform) VALUES (?, ?, ?)",
+              (member.id, used_code, platform))
+    c.execute("SELECT COUNT(*) FROM tracked_joins WHERE platform=?", (platform,))
+    total = c.fetchone()[0]
+    conn.commit()
+    conn.close()
+
+    print(f"[{platform}] {member} se unió con {used_code}")
+
+    if INVITE_LOG_CHANNEL_ID:
+        log_ch = bot.get_channel(INVITE_LOG_CHANNEL_ID)
+        if log_ch:
+            embed = discord.Embed(
+                title="📥 Miembro trackeado",
+                description=f"{member.mention} (`{member.id}`) se unió desde **{platform}**",
+                color=discord.Color.green(),
+                timestamp=datetime.datetime.now()
+            )
+            embed.add_field(name="Invitación", value=f"`{used_code}`", inline=True)
+            embed.add_field(name=f"Total desde {platform}", value=str(total), inline=True)
+            try:
+                await log_ch.send(embed=embed)
+            except discord.Forbidden:
+                pass
 
 # ==================== COMANDOS ====================
 @bot.tree.command(name="apply", description="Enviar solicitud de ingreso", guild=discord.Object(id=GUILD_ID))
@@ -877,6 +984,218 @@ async def stats(interaction: discord.Interaction):
         embed.add_field(name=f"{emoji} {status.upper()}", value=str(count), inline=True)
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+# ==================== COMANDOS DE INVITACIONES ====================
+PLATAFORMAS = [
+    ("TikTok", "tiktok"), ("Instagram", "instagram"), ("YouTube", "youtube"),
+    ("X / Twitter", "twitter"), ("Facebook", "facebook"),
+]
+DURACIONES = [
+    ("30 minutos", 1800), ("1 hora", 3600), ("12 horas", 43200), ("1 día", 86400),
+    ("7 días", 604800), ("30 días", 2592000), ("Nunca caduca ♾️", 0),
+]
+LIMITE_USOS = [
+    ("1 uso", 1), ("5 usos", 5), ("10 usos", 10), ("25 usos", 25),
+    ("50 usos", 50), ("100 usos", 100), ("Sin límite ♾️", 0),
+]
+
+class CustomPlatformModal(discord.ui.Modal, title="Plataforma personalizada"):
+    def __init__(self, view: "InviteCreatorView"):
+        super().__init__()
+        self.view = view
+        self.nombre = discord.ui.TextInput(
+            label="Nombre de la plataforma o motivo",
+            placeholder="Ej: Amigos, Reclutamiento, Evento...",
+            max_length=30,
+            required=True
+        )
+        self.add_item(self.nombre)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        self.view.platform = self.nombre.value.strip()
+        await interaction.response.edit_message(embed=self.view.build_embed())
+
+class InviteCreatorView(discord.ui.View):
+    def __init__(self, canal: discord.TextChannel):
+        super().__init__(timeout=300)
+        self.canal = canal
+        self.platform = None
+        self.max_age = 0     # 0 = nunca caduca
+        self.max_uses = 0    # 0 = sin límite
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not interaction.user.guild_permissions.manage_guild:
+            await interaction.response.send_message("⛔ Solo el staff puede usar este menú.", ephemeral=True)
+            return False
+        return True
+
+    def build_embed(self) -> discord.Embed:
+        dur = next((l for l, v in DURACIONES if v == self.max_age), "?")
+        uso = next((l for l, v in LIMITE_USOS if v == self.max_uses), "?")
+        plat = self.platform.capitalize() if self.platform else "⚠️ Elige una en el menú 1"
+        embed = discord.Embed(title="🛠️ Configurar invitación trackeada", color=discord.Color.blurple())
+        embed.add_field(name="📣 Plataforma", value=plat)
+        embed.add_field(name="🕐 Caducidad", value=dur)
+        embed.add_field(name="👥 Límite de usos", value=uso)
+        embed.add_field(name="🎯 Canal de destino", value=self.canal.mention, inline=False)
+        embed.set_footer(text="Elige en los menús y pulsa ✨ Crear invitación")
+        return embed
+
+    @discord.ui.select(
+        placeholder="📣 1. Plataforma",
+        options=[
+            discord.SelectOption(label=l, value=v) for l, v in PLATAFORMAS
+        ] + [
+            discord.SelectOption(label="✏️ Otra (escribir motivo...)", value="otra_custom")
+        ],
+        row=0
+    )
+    async def sel_plataforma(self, interaction: discord.Interaction, select: discord.ui.Select):
+        valor = select.values[0]
+        if valor == "otra_custom":
+            await interaction.response.send_modal(CustomPlatformModal(self))
+        else:
+            self.platform = valor
+            await interaction.response.edit_message(embed=self.build_embed())
+
+    @discord.ui.select(
+        placeholder="🕐 2. Caducidad",
+        options=[discord.SelectOption(label=l, value=str(v), default=(v == 0)) for l, v in DURACIONES],
+        row=1
+    )
+    async def sel_duracion(self, interaction: discord.Interaction, select: discord.ui.Select):
+        self.max_age = int(select.values[0])
+        await interaction.response.edit_message(embed=self.build_embed())
+
+    @discord.ui.select(
+        placeholder="👥 3. Límite de usos",
+        options=[discord.SelectOption(label=l, value=str(v), default=(v == 0)) for l, v in LIMITE_USOS],
+        row=2
+    )
+    async def sel_usos(self, interaction: discord.Interaction, select: discord.ui.Select):
+        self.max_uses = int(select.values[0])
+        await interaction.response.edit_message(embed=self.build_embed())
+
+    @discord.ui.button(label="✨ Crear invitación", style=discord.ButtonStyle.green, row=3, emoji="🔗")
+    async def btn_crear(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.platform:
+            return await interaction.response.send_message(
+                "❌ Primero elige la **plataforma** en el menú 1.", ephemeral=True)
+
+        await interaction.response.defer(ephemeral=True)
+        try:
+            invite = await self.canal.create_invite(
+                max_age=self.max_age, max_uses=self.max_uses, unique=True,
+                reason=f"Invitación trackeada: {self.platform}"
+            )
+        except discord.Forbidden:
+            return await interaction.followup.send("❌ No tengo permiso para crear invitaciones en ese canal.", ephemeral=True)
+
+        conn = sqlite3.connect(INVITES_DB)
+        c = conn.cursor()
+        c.execute("INSERT OR REPLACE INTO tracked_invites (code, platform, channel_id, inviter_id) VALUES (?, ?, ?, ?)",
+                  (invite.code, self.platform, self.canal.id, interaction.user.id))
+        conn.commit()
+        conn.close()
+        bot.invite_cache[invite.code] = invite.uses
+
+        dur = next(l for l, v in DURACIONES if v == self.max_age)
+        uso = next(l for l, v in LIMITE_USOS if v == self.max_uses)
+
+        for child in self.children:
+            child.disabled = True
+        await interaction.message.edit(view=self)
+
+        embed = discord.Embed(title=f"✅ Invitación creada: {self.platform.capitalize()}",
+                              color=discord.Color.green(), timestamp=datetime.datetime.now())
+        embed.add_field(name="Link (para tu bio)", value=f"https://discord.gg/{invite.code}", inline=False)
+        embed.add_field(name="🕐 Caducidad", value=dur, inline=True)
+        embed.add_field(name="👥 Límite", value=uso, inline=True)
+        embed.add_field(name="🎯 Canal", value=self.canal.mention, inline=True)
+        await interaction.edit_original_response(embed=embed, view=None)
+
+invites_group = app_commands.Group(
+    name="invitar",
+    description="Gestión de invitaciones trackeadas por plataforma",
+    guild_ids=[GUILD_ID],
+    default_permissions=discord.Permissions(manage_guild=True)
+)
+
+@invites_group.command(name="crear", description="Crear invitación trackeada con menú interactivo")
+@app_commands.describe(canal="Canal de destino (por defecto: el canal del sistema)")
+async def invitar_crear(interaction: discord.Interaction, canal: discord.TextChannel = None):
+    canal = canal or interaction.guild.system_channel
+    if canal is None:
+        return await interaction.response.send_message(
+            "❌ No encontré el canal del sistema. Indica uno con la opción `canal`.", ephemeral=True)
+    view = InviteCreatorView(canal)
+    await interaction.response.send_message(embed=view.build_embed(), view=view, ephemeral=True)
+
+@invites_group.command(name="stats", description="Ver desde qué plataformas se unen los miembros")
+async def invitar_stats(interaction: discord.Interaction):
+    conn = sqlite3.connect(INVITES_DB)
+    c = conn.cursor()
+    c.execute("SELECT platform, COUNT(*) FROM tracked_joins GROUP BY platform ORDER BY COUNT(*) DESC")
+    rows = c.fetchall()
+    conn.close()
+
+    if not rows:
+        return await interaction.response.send_message(
+            "Aún no se ha unido nadie por invitaciones trackeadas.", ephemeral=True)
+
+    total = sum(r[1] for r in rows)
+    embed = discord.Embed(title="📊 Origen de miembros", color=discord.Color.purple(),
+                          timestamp=datetime.datetime.now())
+    for platform, count in rows:
+        pct = round(count / total * 100)
+        embed.add_field(name=platform.capitalize(), value=f"{count} miembros ({pct}%)", inline=True)
+    embed.add_field(name="Total trackeado", value=str(total), inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@invites_group.command(name="listar", description="Ver todas las invitaciones trackeadas")
+async def invitar_listar(interaction: discord.Interaction):
+    conn = sqlite3.connect(INVITES_DB)
+    c = conn.cursor()
+    c.execute("SELECT code, platform, created_at FROM tracked_invites ORDER BY created_at DESC")
+    rows = c.fetchall()
+    conn.close()
+
+    if not rows:
+        return await interaction.response.send_message("No hay invitaciones trackeadas.", ephemeral=True)
+
+    description = "\n".join(
+        f"**{p.capitalize()}** → https://discord.gg/{code} (creada {fecha})" for code, p, fecha in rows)
+    embed = discord.Embed(title="🔗 Invitaciones trackeadas", description=description, color=discord.Color.blue())
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@invites_group.command(name="borrar", description="Eliminar una invitación trackeada")
+@app_commands.describe(codigo="Código de la invitación (el final del link)")
+async def invitar_borrar(interaction: discord.Interaction, codigo: str):
+    conn = sqlite3.connect(INVITES_DB)
+    c = conn.cursor()
+    c.execute("SELECT platform FROM tracked_invites WHERE code=?", (codigo,))
+    if not c.fetchone():
+        conn.close()
+        return await interaction.response.send_message("❌ Esa invitación no está trackeada.", ephemeral=True)
+    conn.close()
+
+    try:
+        invite = await interaction.guild.fetch_invite(codigo)
+        await invite.delete()
+    except discord.NotFound:
+        pass  # ya no existe en Discord, solo limpiamos la DB
+    except discord.Forbidden:
+        return await interaction.response.send_message("❌ No tengo permiso para borrarla.", ephemeral=True)
+
+    conn = sqlite3.connect(INVITES_DB)
+    c = conn.cursor()
+    c.execute("DELETE FROM tracked_invites WHERE code=?", (codigo,))
+    conn.commit()
+    conn.close()
+    bot.invite_cache.pop(codigo, None)
+    await interaction.response.send_message(f"🗑️ Invitación `{codigo}` eliminada.", ephemeral=True)
+
+bot.tree.add_command(invites_group)
 
 # ============================================
 # SERVIDOR WEB PARA MANTENER RAILWAY ACTIVO
