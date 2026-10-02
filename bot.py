@@ -1019,6 +1019,9 @@ class CustomPlatformModal(discord.ui.Modal, title="Plataforma personalizada"):
         self.view.platform = texto
         try:
             await interaction.response.edit_message(embed=self.view.build_embed())
+        except discord.NotFound:
+            await interaction.response.send_message(
+                f"✅ Plataforma guardada: **{texto}**. Como el menú fue descartado, usa `/invitar crear` de nuevo para crear la invitación.", ephemeral=True)
         except Exception as e:
             # Si no se puede editar el mensaje original, avisar igual
             try:
@@ -1082,7 +1085,10 @@ class InviteCreatorView(discord.ui.View):
             await interaction.response.send_modal(CustomPlatformModal(self))
         else:
             self.platform = valor
-            await interaction.response.edit_message(embed=self.build_embed())
+            try:
+                await interaction.response.edit_message(embed=self.build_embed())
+            except discord.NotFound:
+                await interaction.response.send_message("✅ Guardado. El menú fue descartado, usa /invitar crear de nuevo para verlo.", ephemeral=True)
 
     @discord.ui.select(
         placeholder="🕐 2. Caducidad",
@@ -1091,7 +1097,10 @@ class InviteCreatorView(discord.ui.View):
     )
     async def sel_duracion(self, interaction: discord.Interaction, select: discord.ui.Select):
         self.max_age = int(select.values[0])
-        await interaction.response.edit_message(embed=self.build_embed())
+        try:
+            await interaction.response.edit_message(embed=self.build_embed())
+        except discord.NotFound:
+            pass
 
     @discord.ui.select(
         placeholder="👥 3. Límite de usos",
@@ -1100,7 +1109,10 @@ class InviteCreatorView(discord.ui.View):
     )
     async def sel_usos(self, interaction: discord.Interaction, select: discord.ui.Select):
         self.max_uses = int(select.values[0])
-        await interaction.response.edit_message(embed=self.build_embed())
+        try:
+            await interaction.response.edit_message(embed=self.build_embed())
+        except discord.NotFound:
+            pass
 
     @discord.ui.button(label="✨ Crear invitación", style=discord.ButtonStyle.green, row=3, emoji="🔗")
     async def btn_crear(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1130,7 +1142,10 @@ class InviteCreatorView(discord.ui.View):
 
         for child in self.children:
             child.disabled = True
-        await interaction.message.edit(view=self)
+        try:
+            await interaction.message.edit(view=self)
+        except discord.NotFound:
+            pass  # el mensaje efímero fue descartado: no es grave, seguimos
 
         embed = discord.Embed(title=f"✅ Invitación creada: {self.platform.capitalize()}",
                               color=discord.Color.green(), timestamp=datetime.datetime.now())
@@ -1138,7 +1153,10 @@ class InviteCreatorView(discord.ui.View):
         embed.add_field(name="🕐 Caducidad", value=dur, inline=True)
         embed.add_field(name="👥 Límite", value=uso, inline=True)
         embed.add_field(name="🎯 Canal", value=self.canal.mention, inline=True)
-        await interaction.edit_original_response(embed=embed, view=None)
+        try:
+            await interaction.edit_original_response(embed=embed, view=None)
+        except discord.NotFound:
+            await interaction.followup.send(embed=embed, ephemeral=True)
 
         # Publicar también en el canal de logs (histórico permanente de links)
         if INVITE_LOG_CHANNEL_ID:
