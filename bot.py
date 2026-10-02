@@ -1106,6 +1106,24 @@ class InviteCreatorView(discord.ui.View):
         embed.add_field(name="👥 Límite", value=uso, inline=True)
         embed.add_field(name="🎯 Canal", value=self.canal.mention, inline=True)
         await interaction.edit_original_response(embed=embed, view=None)
+                # Publicar también en el canal de logs (histórico de links)
+        if INVITE_LOG_CHANNEL_ID:
+            log_ch = bot.get_channel(INVITE_LOG_CHANNEL_ID)
+            if log_ch:
+                log_embed = discord.Embed(
+                    title=f"🔗 Nueva invitación: {self.platform.capitalize()}",
+                    description=f"**Link:** https://discord.gg/{invite.code}",
+                    color=discord.Color.blurple(),
+                    timestamp=datetime.datetime.now()
+                )
+                log_embed.add_field(name="🕐 Caducidad", value=dur, inline=True)
+                log_embed.add_field(name="👥 Límite", value=uso, inline=True)
+                log_embed.add_field(name="🎯 Canal", value=self.canal.mention, inline=True)
+                log_embed.set_footer(text=f"Creada por {interaction.user.display_name}")
+                try:
+                    await log_ch.send(embed=log_embed)
+                except discord.Forbidden:
+                    pass
 
 invites_group = app_commands.Group(
     name="invitar",
