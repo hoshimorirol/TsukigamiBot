@@ -999,9 +999,38 @@ LIMITE_USOS = [
     ("50 usos", 50), ("100 usos", 100), ("Sin límite ♾️", 0),
 ]
 
+class CustomPlatformModal(discord.ui.Modal, title="Plataforma personalizada"):
+    def __init__(self, view: "InviteCreatorView"):
+        super().__init__()
+        self.view = view
+        self.nombre = discord.ui.TextInput(
+            label="Nombre de la plataforma o motivo",
+            placeholder="Ej: Amigos, Reclutamiento, Evento...",
+            max_length=30,
+            required=True
+        )
+        self.add_item(self.nombre)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        texto = self.nombre.value.strip()
+        if not texto:
+            return await interaction.response.send_message(
+                "❌ El nombre no puede estar vacío.", ephemeral=True)
+        self.view.platform = texto
+        try:
+            await interaction.response.edit_message(embed=self.view.build_embed())
+        except Exception as e:
+            # Si no se puede editar el mensaje original, avisar igual
+            try:
+                await interaction.response.send_message(
+                    f"✅ Plataforma guardada: **{texto}**. Pulsa ✨ Crear invitación.", ephemeral=True)
+            except Exception:
+                pass
+            print(f"⚠️ Error editando embed tras modal: {e}")
+
 class InviteCreatorView(discord.ui.View):
     def __init__(self, canal: discord.TextChannel):
-        super().__init__(timeout=1800)  # ← 30 minutos en vez de 5
+        super().__init__(timeout=300)
         self.canal = canal
         self.platform = None
         self.max_age = 0     # 0 = nunca caduca
@@ -1012,6 +1041,19 @@ class InviteCreatorView(discord.ui.View):
             await interaction.response.send_message("⛔ Solo el staff puede usar este menú.", ephemeral=True)
             return False
         return True
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item):
+        # Si algo falla en cualquier componente, responder SIEMPRE con algo visible
+        print(f"⚠️ Error en InviteCreatorView ({item}): {error}")
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    f"❌ Error: `{error}`\nRevisa los logs de Railway para más detalle.", ephemeral=True)
+            else:
+                await interaction.followup.send(
+                    f"❌ Error: `{error}`\nRevisa los logs de Railway para más detalle.", ephemeral=True)
+        except Exception:
+            pass
 
     def build_embed(self) -> discord.Embed:
         dur = next((l for l, v in DURACIONES if v == self.max_age), "?")
@@ -1067,30 +1109,21 @@ class InviteCreatorView(discord.ui.View):
                 "❌ Primero elige la **plataforma** en el menú 1.", ephemeral=True)
 
         await interaction.response.defer(ephemeral=True)
-
-        # Crear la invitación en Discord (con reporte de errores)
         try:
             invite = await self.canal.create_invite(
                 max_age=self.max_age, max_uses=self.max_uses, unique=True,
                 reason=f"Invitación trackeada: {self.platform}"
             )
         except discord.Forbidden:
-            return await interaction.followup.send(
-                "❌ No tengo permiso para crear invitaciones en ese canal.", ephemeral=True)
-        except Exception as e:
-            return await interaction.followup.send(f"❌ Error al crear la invitación: `{e}`", ephemeral=True)
+            return await interaction.followup.send("❌ No tengo permiso para crear invitaciones en ese canal.", ephemeral=True)
 
-        # Guardar en la base de datos (con reporte de errores)
-        try:
-            conn = sqlite3.connect(INVITES_DB)
-            c = conn.cursor()
-            c.execute("INSERT OR REPLACE INTO tracked_invites (code, platform, channel_id, inviter_id) VALUES (?, ?, ?, ?)",
-                      (invite.code, self.platform, self.canal.id, interaction.user.id))
-            conn.commit()
-            conn.close()
-            bot.invite_cache[invite.code] = invite.uses
-        except Exception as e:
-            return await interaction.followup.send(f"❌ Error guardando en la base de datos: `{e}`", ephemeral=True)
+        conn = sqlite3.connect(INVITES_DB)
+        c = conn.cursor()
+        c.execute("INSERT OR REPLACE INTO tracked_invites (code, platform, channel_id, inviter_id) VALUES (?, ?, ?, ?)",
+                  (invite.code, self.platform, self.canal.id, interaction.user.id))
+        conn.commit()
+        conn.close()
+        bot.invite_cache[invite.code] = invite.uses
 
         dur = next(l for l, v in DURACIONES if v == self.max_age)
         uso = next(l for l, v in LIMITE_USOS if v == self.max_uses)
@@ -1106,7 +1139,8 @@ class InviteCreatorView(discord.ui.View):
         embed.add_field(name="👥 Límite", value=uso, inline=True)
         embed.add_field(name="🎯 Canal", value=self.canal.mention, inline=True)
         await interaction.edit_original_response(embed=embed, view=None)
-                # Publicar también en el canal de logs (histórico de links)
+
+        # Publicar también en el canal de logs (histórico permanente de links)
         if INVITE_LOG_CHANNEL_ID:
             log_ch = bot.get_channel(INVITE_LOG_CHANNEL_ID)
             if log_ch:
