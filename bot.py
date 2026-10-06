@@ -285,7 +285,18 @@ class ApplicationModalPart2(discord.ui.Modal, title="Solicitud — Parte 2 de 2"
             embed.set_footer(text="Esperando revisión del staff")
 
             view = interaction.client.build_review_view(app_id, interaction.user.id)
-            msg = await review_ch.send(embed=embed, view=view)
+
+            # Mencionar a los Shinobis para que reciban notificación
+            mentions = []
+            admin_role = interaction.guild.get_role(ADMIN_ROLE_ID)
+            mod_role = interaction.guild.get_role(MODERATOR_ROLE_ID)
+            if admin_role:
+                mentions.append(admin_role.mention)
+            if mod_role:
+                mentions.append(mod_role.mention)
+            content = " ".join(mentions) if mentions else None
+
+            msg = await review_ch.send(content=content, embed=embed, view=view)
 
             conn = sqlite3.connect('applications.db')
             c = conn.cursor()
