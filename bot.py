@@ -19,9 +19,14 @@ MEMBER_ROLE_ID = int(os.getenv("MEMBER_ROLE_ID", "0"))
 UNVERIFIED_ROLE_ID = int(os.getenv("UNVERIFIED_ROLE_ID", "0"))
 INVITE_LOG_CHANNEL_ID = int(os.getenv("INVITE_LOG_CHANNEL_ID", "0"))
 
+# Directorio persistente para las bases de datos (volumen de Railway)
+DB_DIR = os.getenv("DB_DIR", ".")
+APPLICATIONS_DB = os.path.join(DB_DIR, 'applications.db')
+INVITES_DB = os.path.join(DB_DIR, 'invites.db')
+
 # ==================== BASE DE DATOS ====================
 def init_db():
-    conn = sqlite3.connect('applications.db')
+    conn = sqlite3.connect(APPLICATIONS_DB)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS applications (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -51,8 +56,6 @@ def init_db():
 init_db()
 
 # ==================== MÓDULO: INVITACIONES TRACKEADAS ====================
-INVITES_DB = 'invites.db'
-
 def init_invites_db():
     conn = sqlite3.connect(INVITES_DB)
     c = conn.cursor()
@@ -87,7 +90,7 @@ def has_member_role(member: discord.Member) -> bool:
 
 def has_pending_application(user_id: int) -> bool:
     """Devuelve True solo si hay una solicitud pending de menos de 7 días."""
-    conn = sqlite3.connect('applications.db')
+    conn = sqlite3.connect(APPLICATIONS_DB)
     c = conn.cursor()
     # Ignorar solicitudes pending de más de 7 días (atascadas)
     c.execute("""
@@ -170,7 +173,7 @@ class ApplicationModalPart1(discord.ui.Modal, title="Solicitud — Parte 1 de 2"
 
     async def on_submit(self, interaction: discord.Interaction):
         # GUARDAR EN SQLITE en vez de memoria RAM
-        conn = sqlite3.connect('applications.db')
+        conn = sqlite3.connect(APPLICATIONS_DB)
         c = conn.cursor()
         c.execute('''INSERT OR REPLACE INTO draft_answers 
             (user_id, q1, q2, q3, q4, q5, created_at) 
@@ -232,7 +235,7 @@ class ApplicationModalPart2(discord.ui.Modal, title="Solicitud — Parte 2 de 2"
             )
 
         # RECUPERAR de SQLite en vez de memoria
-        conn = sqlite3.connect('applications.db')
+        conn = sqlite3.connect(APPLICATIONS_DB)
         c = conn.cursor()
         c.execute("SELECT q1, q2, q3, q4, q5 FROM draft_answers WHERE user_id=?", (user_id,))
         part1 = c.fetchone()
@@ -298,7 +301,7 @@ class ApplicationModalPart2(discord.ui.Modal, title="Solicitud — Parte 2 de 2"
 
             msg = await review_ch.send(content=content, embed=embed, view=view)
 
-            conn = sqlite3.connect('applications.db')
+            conn = sqlite3.connect(APPLICATIONS_DB)
             c = conn.cursor()
             c.execute(
                 "INSERT OR REPLACE INTO review_messages (message_id, channel_id, app_id, user_id) VALUES (?, ?, ?, ?)",
@@ -337,7 +340,7 @@ class ReviewCommentModal(discord.ui.Modal):
 
         try:
             member = interaction.guild.get_member(self.user_id)
-            conn = sqlite3.connect('applications.db')
+            conn = sqlite3.connect(APPLICATIONS_DB)
             c = conn.cursor()
 
             if self.action == "accepted":
@@ -475,7 +478,7 @@ class BanCommentModal(discord.ui.Modal):
             if member:
                 await member.ban(reason=f"Baneado desde panel por {interaction.user}: {reason_text}")
 
-            conn = sqlite3.connect('applications.db')
+            conn = sqlite3.connect(APPLICATIONS_DB)
             c = conn.cursor()
             c.execute(
                 "UPDATE applications SET status=?, reviewed_by=?, review_note=? WHERE id=?",
@@ -715,7 +718,7 @@ class Bot(commands.Bot):
 
     async def setup_hook(self):
         # RECONSTRUIR BOTONES DE MENSAJES ANTIGUOS (persistencia al reiniciar)
-        conn = sqlite3.connect('applications.db')
+        conn = sqlite3.connect(APPLICATIONS_DB)
         c = conn.cursor()
         c.execute("""
             SELECT rm.message_id, rm.channel_id, rm.app_id, rm.user_id 
@@ -743,7 +746,7 @@ class Bot(commands.Bot):
                 reconstruidos += 1
             except discord.NotFound:
                 print(f"🗑️ Mensaje {msg_id} borrado, eliminando registro...")
-                conn = sqlite3.connect('applications.db')
+                conn = sqlite3.connect(APPLICATIONS_DB)
                 c = conn.cursor()
                 c.execute("DELETE FROM review_messages WHERE message_id=?", (msg_id,))
                 conn.commit()
@@ -807,8 +810,10 @@ async def on_member_join(member):
     bot.invite_cache = {inv.code: inv.uses for inv in fresh}
 
     if not used_code:
+        print(f"🔍 {member} se unió pero no se detectó invitación usada (¿invitación de servidor/vanity?)")
         return
 
+    print(f"🔍 {member} usó la invitación {used_code}")
     conn = sqlite3.connect(INVITES_DB)
     c = conn.cursor()
     c.execute("SELECT platform FROM tracked_invites WHERE code=?", (used_code,))
@@ -857,7 +862,7 @@ async def apply(interaction: discord.Interaction):
         )
 
     # Limpiar borrador viejo si existe
-    conn = sqlite3.connect('applications.db')
+    conn = sqlite3.connect(APPLICATIONS_DB)
     c = conn.cursor()
     c.execute("DELETE FROM draft_answers WHERE user_id=?", (interaction.user.id,))
     conn.commit()
@@ -891,7 +896,7 @@ async def cancel_apply(interaction: discord.Interaction):
     if has_member_role(interaction.user):
         return await interaction.response.send_message("❌ Ya eres miembro.", ephemeral=True)
 
-    conn = sqlite3.connect('applications.db')
+    conn = sqlite3.connect(APPLICATIONS_DB)
     c = conn.cursor()
     c.execute("SELECT id FROM applications WHERE user_id=? AND status='pending'", (interaction.user.id,))
     row = c.fetchone()
@@ -944,7 +949,7 @@ async def setup_panel(interaction: discord.Interaction):
             )
 
         # Limpiar borrador viejo si existe
-        conn = sqlite3.connect('applications.db')
+        conn = sqlite3.connect(APPLICATIONS_DB)
         c = conn.cursor()
         c.execute("DELETE FROM draft_answers WHERE user_id=?", (btn_interaction.user.id,))
         conn.commit()
@@ -983,7 +988,7 @@ async def setup_panel(interaction: discord.Interaction):
 @bot.tree.command(name="stats", description="Ver estadísticas (Staff)", guild=discord.Object(id=GUILD_ID))
 @app_commands.checks.has_permissions(manage_messages=True)
 async def stats(interaction: discord.Interaction):
-    conn = sqlite3.connect('applications.db')
+    conn = sqlite3.connect(APPLICATIONS_DB)
     c = conn.cursor()
     c.execute("SELECT status, COUNT(*) FROM applications GROUP BY status")
     rows = c.fetchall()
